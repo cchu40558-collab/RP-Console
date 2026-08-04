@@ -13,15 +13,15 @@ It intentionally does **not** yet provide remote line mutation, mTLS enrollment,
 
 ## Server deployment
 
-The next deployment-automation release is `v2.0.21`. It installs only RP Console itself: it does not install Xray or create proxy lines.
+The next deployment-automation release is `v2.0.22`. It installs only RP Console itself: it does not install Xray or create proxy lines.
 
 Before the first installation, create the Cloudflare DNS record and open TCP `80` and `443` in the cloud-provider firewall. Set Cloudflare SSL/TLS to `Full` temporarily. The installer creates a short-lived self-signed origin certificate so that the administrator can finish TLS setup in the web panel. Run as root or through `sudo`:
 
 ```bash
 sudo env \
-  CONSOLE_REPO_REF=v2.0.21 \
+  CONSOLE_REPO_REF=v2.0.22 \
   CONSOLE_DOMAIN=rp-console.wakeup-ai.top \
-  bash <(curl -fsSL https://raw.githubusercontent.com/cchu40558-collab/RP-Console/v2.0.21/scripts/install-server.sh)
+  bash <(curl -fsSL https://raw.githubusercontent.com/cchu40558-collab/RP-Console/v2.0.22/scripts/install-server.sh)
 ```
 
 After signing in, open **Site settings**, enter the domain, upload the Cloudflare Origin Certificate and matching private key, then choose **Save and apply**. RP Console validates the pair, atomically replaces only its own Nginx TLS configuration, reloads Nginx, and opens UFW ports `80/443` when UFW is active. It does not expose port `2053`. After the panel reports success, change Cloudflare SSL/TLS to `Full (strict)`.

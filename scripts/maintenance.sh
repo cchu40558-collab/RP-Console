@@ -32,18 +32,31 @@ maintenance_version() {
 
 maintenance_health_check() {
     local expected_version="${1:-}"
-    local body
+    local body attempt
 
-    systemctl is-active --quiet rp-console.service || return 1
-    body="$(curl --fail --silent --show-error --max-time 5 http://127.0.0.1:2053/healthz)" || return 1
-    grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' <<<"${body}" || return 1
-    if [[ -n "${expected_version}" ]]; then
-        grep -Eq '"version"[[:space:]]*:[[:space:]]*"'"${expected_version}"'"' <<<"${body}" || return 1
-    fi
+    for attempt in {1..20}; do
+        if systemctl is-active --quiet rp-console.service; then
+            body="$(curl --fail --silent --show-error --max-time 2 http://127.0.0.1:2053/healthz 2>/dev/null || true)"
+            if grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' <<<"${body}"; then
+                if [[ -z "${expected_version}" ]] || grep -Eq '"version"[[:space:]]*:[[:space:]]*"'"${expected_version}"'"' <<<"${body}"; then
+                    return 0
+                fi
+            fi
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 maintenance_nginx_check() {
     nginx -t >/dev/null
+}
+
+maintenance_print_service_diagnostics() {
+    printf '%s\n' 'rp-console: service diagnostics follow:' >&2
+    systemctl status rp-console.service --no-pager -l >&2 || true
+    journalctl -u rp-console.service -n 80 --no-pager -l >&2 || true
+    ss -lntp >&2 || true
 }
 
 maintenance_copy_if_present() {
@@ -117,8 +130,10 @@ maintenance_restore_snapshot() {
         ln -s "${RP_CONSOLE_NGINX_SITE}" "${RP_CONSOLE_NGINX_ENABLED}"
     fi
 
+    chown root:root "${RP_CONSOLE_APP_DIR}" "${RP_CONSOLE_APP_DIR}/rp-console" "${RP_CONSOLE_APP_DIR}/VERSION"
     chown -R rp-console:rp-console "${RP_CONSOLE_DATA_DIR}"
-	chmod 0755 "${RP_CONSOLE_APP_DIR}" "${RP_CONSOLE_APP_DIR}/rp-console"
+    chmod 0755 "${RP_CONSOLE_APP_DIR}" "${RP_CONSOLE_APP_DIR}/rp-console"
+    chmod 0644 "${RP_CONSOLE_APP_DIR}/VERSION"
     chmod 0700 "${RP_CONSOLE_DATA_DIR}"
     chmod 0600 "${RP_CONSOLE_ENV_DIR}/rp-console.env"
     chmod 0600 "${RP_CONSOLE_ENV_DIR}/tls/origin.key"
@@ -126,8 +141,12 @@ maintenance_restore_snapshot() {
     systemctl daemon-reload
     maintenance_nginx_check
     systemctl reload nginx
-    systemctl enable --now rp-console.service >/dev/null
-    maintenance_health_check "$(tr -d '\r\n' < "${RP_CONSOLE_APP_DIR}/VERSION")"
+    systemctl enable rp-console.service >/dev/null
+    systemctl restart rp-console.service
+    if ! maintenance_health_check "$(tr -d '\r\n' < "${RP_CONSOLE_APP_DIR}/VERSION")"; then
+        maintenance_print_service_diagnostics
+        return 1
+    fi
 }
 
 maintenance_prune_backups() {

@@ -324,11 +324,14 @@ build_binary() {
 
 install_runtime_files() {
     install -d -m 0755 "${APP_DIR}" "${LIB_DIR}"
+	chmod 0755 "${APP_DIR}"
     install -m 0755 "${BUILD_BINARY}" "${APP_DIR}/rp-console.new"
     mv -f "${APP_DIR}/rp-console.new" "${APP_DIR}/rp-console"
+	chmod 0755 "${APP_DIR}/rp-console"
     printf '%s\n' "${SOURCE_VERSION}" > "${APP_DIR}/VERSION.new"
     chmod 0644 "${APP_DIR}/VERSION.new"
     mv -f "${APP_DIR}/VERSION.new" "${APP_DIR}/VERSION"
+	chmod 0644 "${APP_DIR}/VERSION"
     install -m 0700 "${SOURCE_DIR}/scripts/maintenance.sh" "${LIB_DIR}/maintenance.sh"
     install -m 0750 "${BUILD_APPLY_BINARY}" "${LIB_DIR}/apply-site"
 }
@@ -450,14 +453,10 @@ EOF
 
 start_and_verify_service() {
     systemctl daemon-reload
-    systemctl enable --now rp-console.service >/dev/null
-    local attempt
-    for attempt in {1..15}; do
-        if maintenance_health_check "${SOURCE_VERSION}"; then
-            return 0
-        fi
-        sleep 1
-    done
+    systemctl enable rp-console.service >/dev/null
+    systemctl restart rp-console.service
+    maintenance_health_check "${SOURCE_VERSION}" && return 0
+    maintenance_print_service_diagnostics
     die "RP Console did not pass its local health check"
 }
 
@@ -505,6 +504,10 @@ initial_install() {
 
 upgrade_install() {
     [[ -x "${APP_DIR}/rp-console" && -f "${APP_DIR}/VERSION" && -f "${ENV_FILE}" && -x "${LIB_DIR}/maintenance.sh" ]] || die "an existing complete RP Console installation is required for upgrade"
+	local installed
+	installed="$(tr -d '\r\n' < "${APP_DIR}/VERSION")"
+	maintenance_health_check "${installed}" || die "the currently installed RP Console is not healthy; repair it before upgrading"
+	maintenance_nginx_check || die "the current Nginx configuration is invalid; repair it before upgrading"
     UPGRADE_BACKUP="$(maintenance_snapshot_current "pre-update-${CONSOLE_REPO_REF}")"
     install_runtime_files
     ensure_privileged_apply_setting
