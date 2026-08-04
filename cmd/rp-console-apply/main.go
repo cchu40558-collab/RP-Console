@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -60,6 +61,9 @@ func apply() error {
 	if err := validatePair(domain, certPEM, keyPEM); err != nil {
 		return err
 	}
+	if err := enableFirewall(); err != nil {
+		return fmt.Errorf("ensure firewall ports: %w", err)
+	}
 	certSnapshot, err := snapshot(filepath.Join(tlsDir, "origin.crt"))
 	if err != nil {
 		return err
@@ -94,9 +98,6 @@ func apply() error {
 		return err
 	}
 	if err := replaceNginxSite(domain); err != nil {
-		return err
-	}
-	if err := enableFirewall(); err != nil {
 		return err
 	}
 	committed = true
@@ -256,17 +257,50 @@ func enableFirewall() error {
 	if _, err := exec.LookPath("ufw"); err != nil {
 		return nil
 	}
-	if err := run("ufw", "status"); err != nil {
+	status, err := runOutput(20*time.Second, "ufw", "status")
+	if err != nil {
 		return err
 	}
-	// These two rules are idempotent; port 2053 is never exposed.
-	if err := run("ufw", "allow", "80/tcp"); err != nil {
-		return err
+	if strings.Contains(string(status), "Status: inactive") {
+		return nil
 	}
-	return run("ufw", "allow", "443/tcp")
+	for _, port := range []string{"80", "443"} {
+		if firewallPortAllowed(status, port) {
+			continue
+		}
+		if _, err := runOutput(120*time.Second, "ufw", "allow", port+"/tcp"); err != nil {
+			return fmt.Errorf("allow %s/tcp: %w", port, err)
+		}
+	}
+	return nil
 }
 
-func run(name string, args ...string) error { return exec.Command(name, args...).Run() }
+func firewallPortAllowed(status []byte, port string) bool {
+	for _, line := range strings.Split(string(status), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 4 && fields[0] == port+"/tcp" && fields[1] == "ALLOW" && fields[2] == "IN" && fields[3] == "Anywhere" {
+			return true
+		}
+	}
+	return false
+}
+
+func run(name string, args ...string) error {
+	_, err := runOutput(30*time.Second, name, args...)
+	return err
+}
+
+func runOutput(timeout time.Duration, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, name, args...)
+	command.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	output, err := command.CombinedOutput()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return output, fmt.Errorf("%s timed out after %s", name, timeout)
+	}
+	return output, err
+}
 
 func reloadNginx() error {
 	if err := run("systemctl", "reload", "nginx"); err == nil {

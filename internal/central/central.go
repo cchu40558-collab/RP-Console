@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -42,6 +43,7 @@ const (
 	sessionLifetime  = 12 * time.Hour
 	probeTimeout     = 8 * time.Second
 	backgroundPeriod = 30 * time.Second
+	siteApplyTimeout = 5 * time.Minute
 )
 
 var Version = config.Version
@@ -64,6 +66,8 @@ type App struct {
 	dataDir           string
 	privilegedApply   string
 	siteApplyMu       sync.Mutex
+	siteApplyRunning  bool
+	runSiteApply       func(context.Context, string) ([]byte, error)
 }
 
 type serverRecord struct {
@@ -124,6 +128,7 @@ type persistedState struct {
 	Servers []serverRecord `json:"servers"`
 	Events  []event        `json:"events"`
 	Site    siteConfig     `json:"site"`
+	SiteJob siteApplyJob   `json:"siteJob"`
 }
 
 // siteConfig deliberately contains no private-key material. The certificate
@@ -141,6 +146,29 @@ type siteView struct {
 	CertificateExpiry time.Time `json:"certificateExpiry"`
 	AppliedAt         time.Time `json:"appliedAt"`
 	CanApply          bool      `json:"canApply"`
+	Job               siteApplyJobView `json:"job"`
+}
+
+type siteApplyJob struct {
+	ID        string    `json:"id"`
+	Domain    string    `json:"domain"`
+	Status    string    `json:"status"`
+	Stage     string    `json:"stage"`
+	Message   string    `json:"message"`
+	CreatedAt time.Time `json:"createdAt"`
+	StartedAt time.Time `json:"startedAt"`
+	FinishedAt time.Time `json:"finishedAt"`
+}
+
+type siteApplyJobView struct {
+	ID        string    `json:"id"`
+	Domain    string    `json:"domain"`
+	Status    string    `json:"status"`
+	Stage     string    `json:"stage"`
+	Message   string    `json:"message"`
+	CreatedAt time.Time `json:"createdAt"`
+	StartedAt time.Time `json:"startedAt"`
+	FinishedAt time.Time `json:"finishedAt"`
 }
 
 type privilegedSiteRequest struct {
@@ -236,6 +264,7 @@ func New(cfg Config) (*App, error) {
 		allowPrivateNodes: cfg.AllowPrivateNodes,
 		dataDir:           cfg.DataDir,
 		privilegedApply:   strings.TrimSpace(cfg.PrivilegedApply),
+		runSiteApply:      runPrivilegedSiteApply,
 		sessions:          make(map[string]time.Time),
 		httpClient: &http.Client{
 			Timeout: probeTimeout,
@@ -243,6 +272,9 @@ func New(cfg Config) (*App, error) {
 				return http.ErrUseLastResponse
 			},
 		},
+	}
+	if s.recoverInterruptedSiteApply() {
+		log.Printf("RP Console: a pending site apply job was marked failed after restart")
 	}
 	go a.heartbeatLoop()
 	return a, nil
@@ -440,6 +472,10 @@ func (a *App) applySite(w http.ResponseWriter, r *http.Request) {
 	// apply flow so two authenticated browser sessions cannot mix certificate files.
 	a.siteApplyMu.Lock()
 	defer a.siteApplyMu.Unlock()
+	if a.siteApplyRunning || a.store.siteApplyActive() {
+		writeError(w, http.StatusConflict, "A site configuration task is already running")
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := r.ParseMultipartForm(1 << 20); err != nil {
 		writeError(w, http.StatusBadRequest, "证书文件过大或表单格式不正确")
@@ -481,22 +517,63 @@ func (a *App) applySite(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "保存站点证书失败")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
-	if output, err := exec.CommandContext(ctx, "/usr/bin/sudo", "-n", "--", a.privilegedApply).CombinedOutput(); err != nil {
-		_ = output // Do not expose root-helper output through the public API.
+	jobID, err := randomID(16)
+	if err != nil {
 		a.clearSiteStaging()
-		writeError(w, http.StatusBadGateway, "Nginx 配置或防火墙应用失败；原有站点配置已保留，请查看 rp-console logs")
+		writeError(w, http.StatusInternalServerError, "could not create site apply job")
 		return
 	}
-	if err := a.store.saveSite(siteConfig{
-		Domain: domain, CertificateSHA256: certificateDigest(leaf.Raw), CertificateNotAfter: leaf.NotAfter.UTC(), AppliedAt: time.Now().UTC(),
-	}); err != nil {
-		writeError(w, http.StatusInternalServerError, "站点已应用，但保存状态失败")
+	job := siteApplyJob{ID: jobID, Domain: domain, Status: "queued", Stage: "queued", Message: "Waiting to apply site configuration", CreatedAt: time.Now().UTC()}
+	if err := a.store.queueSiteApply(job); err != nil {
+		a.clearSiteStaging()
+		writeError(w, http.StatusConflict, "A site configuration task is already running")
 		return
 	}
-	a.store.addEvent(serverRecord{Name: "RP Console"}, "site-applied", "info", "总站证书、Nginx 配置和 UFW 端口规则已应用")
-	writeJSON(w, http.StatusOK, a.store.siteView(true))
+	a.siteApplyRunning = true
+	go a.completeSiteApply(job, leaf)
+	writeJSON(w, http.StatusAccepted, a.store.siteView(true))
+}
+
+func runPrivilegedSiteApply(ctx context.Context, helper string) ([]byte, error) {
+	return exec.CommandContext(ctx, "/usr/bin/sudo", "-n", "--", helper).CombinedOutput()
+}
+
+func (a *App) completeSiteApply(job siteApplyJob, leaf *x509.Certificate) {
+	_ = a.store.updateSiteApply(job.ID, "running", "starting", "Checking firewall and site configuration")
+	ctx, cancel := context.WithTimeout(context.Background(), siteApplyTimeout)
+	defer cancel()
+	output, err := a.runSiteApply(ctx, a.privilegedApply)
+	a.clearSiteStaging()
+	if err != nil {
+		message := "Site apply failed; the previous certificate and Nginx configuration were retained"
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			message = "Site apply exceeded five minutes; the previous certificate and Nginx configuration were retained"
+		}
+		log.Printf("RP Console site apply %s failed: %s", job.ID, helperOutputSummary(output))
+		_ = a.store.finishSiteApply(job.ID, "failed", "failed", message, nil)
+		a.store.addEvent(serverRecord{Name: "RP Console"}, "site-apply-failed", "error", message)
+	} else {
+		site := siteConfig{Domain: job.Domain, CertificateSHA256: certificateDigest(leaf.Raw), CertificateNotAfter: leaf.NotAfter.UTC(), AppliedAt: time.Now().UTC()}
+		if err := a.store.finishSiteApply(job.ID, "succeeded", "complete", "Certificate, Nginx, and firewall checks completed", &site); err != nil {
+			log.Printf("RP Console site apply %s completed but state persistence failed: %v", job.ID, err)
+		} else {
+			a.store.addEvent(serverRecord{Name: "RP Console"}, "site-applied", "info", "Site certificate, Nginx configuration, and UFW rules applied")
+		}
+	}
+	a.siteApplyMu.Lock()
+	a.siteApplyRunning = false
+	a.siteApplyMu.Unlock()
+}
+
+func helperOutputSummary(output []byte) string {
+	value := strings.TrimSpace(strings.ReplaceAll(string(output), "\n", " | "))
+	if value == "" {
+		return "helper returned no diagnostic output"
+	}
+	if len(value) > 500 {
+		return value[:500] + "..."
+	}
+	return value
 }
 
 func validateSiteDomain(value string) (string, error) {
@@ -1084,12 +1161,14 @@ func (s *store) events() []event {
 func (s *store) siteView(canApply bool) siteView {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	job := s.state.SiteJob
 	return siteView{
 		Domain:            s.state.Site.Domain,
 		CertificateSHA256: s.state.Site.CertificateSHA256,
 		CertificateExpiry: s.state.Site.CertificateNotAfter,
 		AppliedAt:         s.state.Site.AppliedAt,
 		CanApply:          canApply,
+		Job: siteApplyJobView{ID: job.ID, Domain: job.Domain, Status: job.Status, Stage: job.Stage, Message: job.Message, CreatedAt: job.CreatedAt, StartedAt: job.StartedAt, FinishedAt: job.FinishedAt},
 	}
 }
 
@@ -1098,6 +1177,67 @@ func (s *store) saveSite(site siteConfig) error {
 	defer s.mu.Unlock()
 	s.state.Site = site
 	return s.saveLocked()
+}
+
+func (s *store) siteApplyActive() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.SiteJob.Status == "queued" || s.state.SiteJob.Status == "running"
+}
+
+func (s *store) queueSiteApply(job siteApplyJob) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.SiteJob.Status == "queued" || s.state.SiteJob.Status == "running" {
+		return errors.New("site apply already active")
+	}
+	s.state.SiteJob = job
+	return s.saveLocked()
+}
+
+func (s *store) updateSiteApply(id, status, stage, message string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.SiteJob.ID != id {
+		return errors.New("site apply job not found")
+	}
+	s.state.SiteJob.Status = status
+	s.state.SiteJob.Stage = stage
+	s.state.SiteJob.Message = message
+	if status == "running" && s.state.SiteJob.StartedAt.IsZero() {
+		s.state.SiteJob.StartedAt = time.Now().UTC()
+	}
+	return s.saveLocked()
+}
+
+func (s *store) finishSiteApply(id, status, stage, message string, site *siteConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.SiteJob.ID != id {
+		return errors.New("site apply job not found")
+	}
+	if site != nil {
+		s.state.Site = *site
+	}
+	s.state.SiteJob.Status = status
+	s.state.SiteJob.Stage = stage
+	s.state.SiteJob.Message = message
+	s.state.SiteJob.FinishedAt = time.Now().UTC()
+	return s.saveLocked()
+}
+
+func (s *store) recoverInterruptedSiteApply() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.SiteJob.Status != "queued" && s.state.SiteJob.Status != "running" {
+		return false
+	}
+	s.state.SiteJob.Status = "failed"
+	s.state.SiteJob.Stage = "interrupted"
+	s.state.SiteJob.Message = "RP Console restarted before the previous site apply completed; verify the current certificate before retrying"
+	s.state.SiteJob.FinishedAt = time.Now().UTC()
+	_ = s.saveLocked()
+	return true
 }
 
 func (r serverRecord) toView() serverView {
