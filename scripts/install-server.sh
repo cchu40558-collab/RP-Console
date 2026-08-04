@@ -233,9 +233,10 @@ PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 # The web service writes only its data directory. Its single sudo-whitelisted
-# helper additionally needs these two fixed paths to replace the site's own
-# TLS files and Nginx vhost; the rest of /etc and /usr remain read-only.
-ReadWritePaths=${DATA_DIR} ${ENV_DIR} /etc/nginx/sites-available
+# helper additionally needs these fixed paths to replace the site's TLS files,
+# Nginx vhost, and its own UFW web-port rules; the rest of /etc remains read-only.
+# The web service itself still runs as the unprivileged rp-console user.
+ReadWritePaths=${DATA_DIR} ${ENV_DIR} /etc/nginx/sites-available /etc/ufw
 
 [Install]
 WantedBy=multi-user.target
