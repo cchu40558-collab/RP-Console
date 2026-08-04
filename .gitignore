@@ -1,0 +1,5 @@
+relay-central
+relay-central.exe
+data/
+.env
+*.log
