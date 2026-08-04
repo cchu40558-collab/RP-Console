@@ -278,8 +278,15 @@ func enableFirewall() error {
 func firewallPortAllowed(status []byte, port string) bool {
 	for _, line := range strings.Split(string(status), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 4 && fields[0] == port+"/tcp" && fields[1] == "ALLOW" && fields[2] == "IN" && fields[3] == "Anywhere" {
-			return true
+		if len(fields) < 3 || fields[0] != port+"/tcp" || fields[1] != "ALLOW" {
+			continue
+		}
+		// `ufw status` prints either "ALLOW Anywhere" or "ALLOW IN Anywhere",
+		// depending on the installed UFW version and locale. Both allow inbound TCP.
+		for _, field := range fields[2:] {
+			if strings.HasPrefix(field, "Anywhere") {
+				return true
+			}
 		}
 	}
 	return false
