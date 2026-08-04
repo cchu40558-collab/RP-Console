@@ -7,6 +7,8 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"embed"
 	"encoding/base64"
 	"encoding/hex"
@@ -19,6 +21,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -48,6 +51,7 @@ type Config struct {
 	AdminPassword     string
 	MasterKey         string
 	AllowPrivateNodes bool
+	PrivilegedApply   string
 }
 
 type App struct {
@@ -57,6 +61,9 @@ type App struct {
 	sessions          map[string]time.Time
 	sessionMu         sync.Mutex
 	httpClient        *http.Client
+	dataDir           string
+	privilegedApply   string
+	siteApplyMu       sync.Mutex
 }
 
 type serverRecord struct {
@@ -116,6 +123,28 @@ type event struct {
 type persistedState struct {
 	Servers []serverRecord `json:"servers"`
 	Events  []event        `json:"events"`
+	Site    siteConfig     `json:"site"`
+}
+
+// siteConfig deliberately contains no private-key material. The certificate
+// and its key are staged as fixed files under the application's data directory.
+type siteConfig struct {
+	Domain              string    `json:"domain"`
+	CertificateSHA256   string    `json:"certificateSha256"`
+	CertificateNotAfter time.Time `json:"certificateNotAfter"`
+	AppliedAt           time.Time `json:"appliedAt"`
+}
+
+type siteView struct {
+	Domain            string    `json:"domain"`
+	CertificateSHA256 string    `json:"certificateSha256"`
+	CertificateExpiry time.Time `json:"certificateExpiry"`
+	AppliedAt         time.Time `json:"appliedAt"`
+	CanApply          bool      `json:"canApply"`
+}
+
+type privilegedSiteRequest struct {
+	Domain string `json:"domain"`
 }
 
 type store struct {
@@ -205,6 +234,8 @@ func New(cfg Config) (*App, error) {
 		store:             s,
 		adminPassword:     cfg.AdminPassword,
 		allowPrivateNodes: cfg.AllowPrivateNodes,
+		dataDir:           cfg.DataDir,
+		privilegedApply:   strings.TrimSpace(cfg.PrivilegedApply),
 		sessions:          make(map[string]time.Time),
 		httpClient: &http.Client{
 			Timeout: probeTimeout,
@@ -298,6 +329,8 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/login", a.login)
 	mux.HandleFunc("POST /api/logout", a.requireAuth(a.logout))
 	mux.HandleFunc("GET /api/session", a.requireAuth(a.session))
+	mux.HandleFunc("GET /api/site", a.requireAuth(a.getSite))
+	mux.HandleFunc("POST /api/site/apply", a.requireAuth(a.applySite))
 	mux.HandleFunc("GET /api/servers", a.requireAuth(a.listServers))
 	mux.HandleFunc("POST /api/servers", a.requireAuth(a.createServer))
 	mux.HandleFunc("PATCH /api/servers/{id}", a.requireAuth(a.updateServer))
@@ -388,6 +421,159 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) session(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
+}
+
+func (a *App) getSite(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, a.store.siteView(a.privilegedApply != ""))
+}
+
+func (a *App) applySite(w http.ResponseWriter, r *http.Request) {
+	if !sameOrigin(r) {
+		writeError(w, http.StatusForbidden, "invalid request origin")
+		return
+	}
+	if a.privilegedApply == "" {
+		writeError(w, http.StatusServiceUnavailable, "本站未安装受限的站点配置助手，请先升级 RP Console")
+		return
+	}
+	// The helper consumes fixed staging names. Serialize the complete upload and
+	// apply flow so two authenticated browser sessions cannot mix certificate files.
+	a.siteApplyMu.Lock()
+	defer a.siteApplyMu.Unlock()
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "证书文件过大或表单格式不正确")
+		return
+	}
+	domain, err := validateSiteDomain(r.FormValue("domain"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	certFile, _, err := r.FormFile("certificate")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "请选择 Origin Certificate 证书文件")
+		return
+	}
+	defer certFile.Close()
+	keyFile, _, err := r.FormFile("privateKey")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "请选择 Origin Certificate 私钥文件")
+		return
+	}
+	defer keyFile.Close()
+	certPEM, err := io.ReadAll(io.LimitReader(certFile, 768<<10))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "读取证书文件失败")
+		return
+	}
+	keyPEM, err := io.ReadAll(io.LimitReader(keyFile, 768<<10))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "读取私钥文件失败")
+		return
+	}
+	leaf, err := validateSiteTLS(domain, certPEM, keyPEM)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := a.stageSiteFiles(domain, certPEM, keyPEM); err != nil {
+		writeError(w, http.StatusInternalServerError, "保存站点证书失败")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	if output, err := exec.CommandContext(ctx, "/usr/bin/sudo", "-n", "--", a.privilegedApply).CombinedOutput(); err != nil {
+		_ = output // Do not expose root-helper output through the public API.
+		a.clearSiteStaging()
+		writeError(w, http.StatusBadGateway, "Nginx 配置或防火墙应用失败；原有站点配置已保留，请查看 rp-console logs")
+		return
+	}
+	if err := a.store.saveSite(siteConfig{
+		Domain: domain, CertificateSHA256: certificateDigest(leaf.Raw), CertificateNotAfter: leaf.NotAfter.UTC(), AppliedAt: time.Now().UTC(),
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "站点已应用，但保存状态失败")
+		return
+	}
+	a.store.addEvent(serverRecord{Name: "RP Console"}, "site-applied", "info", "总站证书、Nginx 配置和 UFW 端口规则已应用")
+	writeJSON(w, http.StatusOK, a.store.siteView(true))
+}
+
+func validateSiteDomain(value string) (string, error) {
+	domain := strings.ToLower(strings.TrimSpace(value))
+	if len(domain) > 253 || !strings.Contains(domain, ".") {
+		return "", errors.New("请输入完整的站点域名")
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", errors.New("站点域名格式不正确")
+		}
+		for _, char := range label {
+			if !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '-') {
+				return "", errors.New("站点域名只能包含小写字母、数字、连字符和点")
+			}
+		}
+	}
+	return domain, nil
+}
+
+func validateSiteTLS(domain string, certPEM, keyPEM []byte) (*x509.Certificate, error) {
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil || len(pair.Certificate) == 0 {
+		return nil, errors.New("证书或私钥不是有效的 PEM，或二者不匹配")
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return nil, errors.New("无法读取证书")
+	}
+	if err := leaf.VerifyHostname(domain); err != nil {
+		return nil, errors.New("证书不包含填写的站点域名")
+	}
+	if time.Now().After(leaf.NotAfter) {
+		return nil, errors.New("证书已经过期")
+	}
+	return leaf, nil
+}
+
+func (a *App) stageSiteFiles(domain string, certPEM, keyPEM []byte) error {
+	dir := filepath.Join(a.dataDir, "site-tls")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	request, err := json.Marshal(privilegedSiteRequest{Domain: domain})
+	if err != nil {
+		return err
+	}
+	if err := writePrivateFile(filepath.Join(dir, "origin.crt"), certPEM, 0644); err != nil {
+		return err
+	}
+	if err := writePrivateFile(filepath.Join(dir, "origin.key"), keyPEM, 0600); err != nil {
+		return err
+	}
+	return writePrivateFile(filepath.Join(dir, "request.json"), request, 0600)
+}
+
+func (a *App) clearSiteStaging() {
+	dir := filepath.Join(a.dataDir, "site-tls")
+	for _, name := range []string{"request.json", "origin.crt", "origin.key"} {
+		_ = os.Remove(filepath.Join(dir, name))
+	}
+}
+
+func writePrivateFile(filename string, data []byte, mode os.FileMode) error {
+	temporary := filename + ".new"
+	if err := os.WriteFile(temporary, data, mode); err != nil {
+		return err
+	}
+	if err := os.Chmod(temporary, mode); err != nil {
+		return err
+	}
+	return os.Rename(temporary, filename)
+}
+
+func certificateDigest(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 func (a *App) requireAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -893,6 +1079,25 @@ func (s *store) events() []event {
 	items := make([]event, len(s.state.Events))
 	copy(items, s.state.Events)
 	return items
+}
+
+func (s *store) siteView(canApply bool) siteView {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return siteView{
+		Domain:            s.state.Site.Domain,
+		CertificateSHA256: s.state.Site.CertificateSHA256,
+		CertificateExpiry: s.state.Site.CertificateNotAfter,
+		AppliedAt:         s.state.Site.AppliedAt,
+		CanApply:          canApply,
+	}
+}
+
+func (s *store) saveSite(site siteConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state.Site = site
+	return s.saveLocked()
 }
 
 func (r serverRecord) toView() serverView {

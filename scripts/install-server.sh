@@ -18,6 +18,7 @@ readonly NGINX_SITE="/etc/nginx/sites-available/rp-console.conf"
 readonly NGINX_ENABLED="/etc/nginx/sites-enabled/rp-console.conf"
 readonly GO_ROOT="/opt/rp-console-go"
 readonly RESULT_FILE="/root/rp-console-install-result.env"
+readonly SUDOERS_FILE="/etc/sudoers.d/rp-console-apply"
 
 WORK_DIR=""
 UPGRADE_BACKUP=""
@@ -40,7 +41,7 @@ require_root() {
 
 cleanup_initial_install() {
     systemctl disable --now rp-console.service >/dev/null 2>&1 || true
-    rm -f "${UNIT_FILE}" "${NGINX_SITE}" "${NGINX_ENABLED}" /usr/local/bin/rp-console
+    rm -f "${UNIT_FILE}" "${NGINX_SITE}" "${NGINX_ENABLED}" "${SUDOERS_FILE}" "${RESULT_FILE}" /usr/local/bin/rp-console
     rm -rf "${APP_DIR}" "${LIB_DIR}" "${ENV_DIR}" "${DATA_DIR}"
     if [[ "${APP_USER_CREATED}" -eq 1 ]]; then
         userdel "${APP_USER}" >/dev/null 2>&1 || true
@@ -91,7 +92,7 @@ ensure_packages() {
     command -v apt-get >/dev/null 2>&1 || die "only apt-based Debian/Ubuntu hosts are currently supported"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y ca-certificates curl git nginx openssl build-essential
+    apt-get install -y ca-certificates curl git nginx openssl build-essential sudo
 }
 
 version_at_least() {
@@ -186,8 +187,18 @@ CENTRAL_MASTER_KEY=${master_key}
 CENTRAL_DATA_DIR=${DATA_DIR}
 CENTRAL_LISTEN_ADDR=127.0.0.1:2053
 CENTRAL_ALLOW_PRIVATE_NODES=false
+CENTRAL_PRIVILEGED_APPLY=${LIB_DIR}/apply-site
 EOF
     chmod 0600 "${ENV_FILE}"
+}
+
+ensure_privileged_apply_setting() {
+    local temporary
+    temporary="$(mktemp "${ENV_FILE}.XXXXXX")"
+    chmod 0600 "${temporary}"
+    { grep -v '^CENTRAL_PRIVILEGED_APPLY=' "${ENV_FILE}"; printf 'CENTRAL_PRIVILEGED_APPLY=%s\n' "${LIB_DIR}/apply-site"; } > "${temporary}"
+    install -m 0600 "${temporary}" "${ENV_FILE}"
+    rm -f "${temporary}"
 }
 
 write_initial_result() {
@@ -215,11 +226,16 @@ EnvironmentFile=${ENV_FILE}
 ExecStart=${APP_DIR}/rp-console
 Restart=on-failure
 RestartSec=3
-NoNewPrivileges=true
+# The service can invoke only the exact no-argument helper granted below in
+# /etc/sudoers.d/rp-console-apply. Keeping NoNewPrivileges here would block
+# that narrowly scoped operation altogether.
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=${DATA_DIR}
+# The web service writes only its data directory. Its single sudo-whitelisted
+# helper additionally needs these two fixed paths to replace the site's own
+# TLS files and Nginx vhost; the rest of /etc and /usr remain read-only.
+ReadWritePaths=${DATA_DIR} ${ENV_DIR} /etc/nginx/sites-available
 
 [Install]
 WantedBy=multi-user.target
@@ -296,12 +312,14 @@ build_binary() {
     [[ -n "${required_go}" ]] || die "go.mod does not specify a Go version"
     ensure_go "${required_go}"
     BUILD_BINARY="${WORK_DIR}/rp-console"
+    BUILD_APPLY_BINARY="${WORK_DIR}/rp-console-apply"
     (
         cd "${SOURCE_DIR}"
         "${GO_BINARY}" mod download
         "${GO_BINARY}" build -trimpath -o "${BUILD_BINARY}" ./cmd/relay-central
+        "${GO_BINARY}" build -trimpath -o "${BUILD_APPLY_BINARY}" ./cmd/rp-console-apply
     )
-    [[ -x "${BUILD_BINARY}" ]] || die "RP Console build did not produce an executable"
+    [[ -x "${BUILD_BINARY}" && -x "${BUILD_APPLY_BINARY}" ]] || die "RP Console build did not produce the required executables"
 }
 
 install_runtime_files() {
@@ -312,6 +330,27 @@ install_runtime_files() {
     chmod 0644 "${APP_DIR}/VERSION.new"
     mv -f "${APP_DIR}/VERSION.new" "${APP_DIR}/VERSION"
     install -m 0700 "${SOURCE_DIR}/scripts/maintenance.sh" "${LIB_DIR}/maintenance.sh"
+    install -m 0750 "${BUILD_APPLY_BINARY}" "${LIB_DIR}/apply-site"
+}
+
+write_sudoers_rule() {
+    local temporary
+    temporary="$(mktemp)"
+    printf '%s ALL=(root) NOPASSWD: %s ""\n' "${APP_USER}" "${LIB_DIR}/apply-site" > "${temporary}"
+    chmod 0440 "${temporary}"
+    visudo -cf "${temporary}" >/dev/null || die "generated sudo rule is invalid"
+    install -m 0440 "${temporary}" "${SUDOERS_FILE}"
+    rm -f "${temporary}"
+}
+
+create_bootstrap_certificate() {
+    install -d -m 0700 "${ENV_DIR}/tls"
+    openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 14 \
+        -keyout "${ENV_DIR}/tls/origin.key" \
+        -out "${ENV_DIR}/tls/origin.crt" \
+        -subj "/CN=${CONSOLE_DOMAIN}" >/dev/null 2>&1
+    chmod 0600 "${ENV_DIR}/tls/origin.key"
+    chmod 0644 "${ENV_DIR}/tls/origin.crt"
 }
 
 write_management_command() {
@@ -372,6 +411,7 @@ change_password() {
     unset first second
     systemctl restart rp-console.service
     health_check "$(installed_version)" || die "password was saved but the service health check failed"
+    rm -f /root/rp-console-install-result.env
     printf 'RP Console administrator password updated.\n'
 }
 
@@ -423,9 +463,6 @@ start_and_verify_service() {
 
 initial_install() {
     validate_domain
-    [[ -n "${CONSOLE_TLS_CERT_FILE:-}" ]] || die "CONSOLE_TLS_CERT_FILE is required for the first installation"
-    [[ -n "${CONSOLE_TLS_KEY_FILE:-}" ]] || die "CONSOLE_TLS_KEY_FILE is required for the first installation"
-    validate_tls_pair "${CONSOLE_TLS_CERT_FILE}" "${CONSOLE_TLS_KEY_FILE}"
     [[ ! -e "${NGINX_SITE}" && ! -L "${NGINX_ENABLED}" ]] || die "an RP Console nginx site already exists; use CONSOLE_UPGRADE=true instead"
     ! id "${APP_USER}" >/dev/null 2>&1 || die "the ${APP_USER} user already exists; use CONSOLE_UPGRADE=true after verifying the existing installation"
 
@@ -447,14 +484,13 @@ initial_install() {
     useradd --system --user-group --home-dir "${DATA_DIR}" --shell /usr/sbin/nologin "${APP_USER}"
     APP_USER_CREATED=1
     install -d -m 0700 -o "${APP_USER}" -g "${APP_USER}" "${DATA_DIR}"
-    install -d -m 0700 "${ENV_DIR}/tls"
-    install -m 0644 "${CONSOLE_TLS_CERT_FILE}" "${ENV_DIR}/tls/origin.crt"
-    install -m 0600 "${CONSOLE_TLS_KEY_FILE}" "${ENV_DIR}/tls/origin.key"
+    create_bootstrap_certificate
     write_environment_file "${password}" "${master_key}"
     unset master_key
     write_systemd_unit
     write_nginx_site
     install_runtime_files
+    write_sudoers_rule
     write_management_command
     start_and_verify_service
     enable_nginx_site
@@ -464,13 +500,16 @@ initial_install() {
     write_initial_result "${password}"
     unset password
     log "Initial administrator credentials were saved to ${RESULT_FILE} (root-readable only)."
-    log "Remove the temporary uploaded certificate files when they are no longer needed."
+    log "The site is using a temporary self-signed origin certificate. Upload the Cloudflare Origin Certificate in RP Console > Site settings, then switch Cloudflare to Full (strict)."
 }
 
 upgrade_install() {
     [[ -x "${APP_DIR}/rp-console" && -f "${APP_DIR}/VERSION" && -f "${ENV_FILE}" && -x "${LIB_DIR}/maintenance.sh" ]] || die "an existing complete RP Console installation is required for upgrade"
     UPGRADE_BACKUP="$(maintenance_snapshot_current "pre-update-${CONSOLE_REPO_REF}")"
     install_runtime_files
+    ensure_privileged_apply_setting
+    write_sudoers_rule
+    write_systemd_unit
     write_management_command
     start_and_verify_service
     maintenance_nginx_check

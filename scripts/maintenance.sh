@@ -14,6 +14,7 @@ RP_CONSOLE_UNIT_FILE="${RP_CONSOLE_UNIT_FILE:-/etc/systemd/system/rp-console.ser
 RP_CONSOLE_NGINX_SITE="${RP_CONSOLE_NGINX_SITE:-/etc/nginx/sites-available/rp-console.conf}"
 RP_CONSOLE_NGINX_ENABLED="${RP_CONSOLE_NGINX_ENABLED:-/etc/nginx/sites-enabled/rp-console.conf}"
 RP_CONSOLE_COMMAND="${RP_CONSOLE_COMMAND:-/usr/local/bin/rp-console}"
+RP_CONSOLE_SUDOERS="${RP_CONSOLE_SUDOERS:-/etc/sudoers.d/rp-console-apply}"
 
 maintenance_die() {
     printf 'rp-console: %s\n' "$*" >&2
@@ -70,6 +71,7 @@ maintenance_snapshot_current() {
     maintenance_copy_if_present "${RP_CONSOLE_UNIT_FILE}" "${destination}/rp-console.service"
     maintenance_copy_if_present "${RP_CONSOLE_NGINX_SITE}" "${destination}/rp-console.conf"
     maintenance_copy_if_present "${RP_CONSOLE_COMMAND}" "${destination}/rp-console-command"
+    maintenance_copy_if_present "${RP_CONSOLE_SUDOERS}" "${destination}/rp-console-apply.sudoers"
     if [[ -L "${RP_CONSOLE_NGINX_ENABLED}" ]]; then
         : > "${destination}/nginx-enabled"
     fi
@@ -89,7 +91,7 @@ maintenance_restore_snapshot() {
 
     systemctl stop rp-console.service >/dev/null 2>&1 || true
     rm -rf "${RP_CONSOLE_APP_DIR}" "${RP_CONSOLE_LIB_DIR}" "${RP_CONSOLE_ENV_DIR}" "${RP_CONSOLE_DATA_DIR}"
-    rm -f "${RP_CONSOLE_UNIT_FILE}" "${RP_CONSOLE_NGINX_SITE}" "${RP_CONSOLE_NGINX_ENABLED}"
+    rm -f "${RP_CONSOLE_UNIT_FILE}" "${RP_CONSOLE_NGINX_SITE}" "${RP_CONSOLE_NGINX_ENABLED}" "${RP_CONSOLE_SUDOERS}"
 
     cp -a "${backup}/app" "${RP_CONSOLE_APP_DIR}"
     if [[ -d "${backup}/lib" ]]; then
@@ -105,6 +107,10 @@ maintenance_restore_snapshot() {
     if [[ -f "${backup}/rp-console-command" ]]; then
         cp -a "${backup}/rp-console-command" "${RP_CONSOLE_COMMAND}"
         chmod 0755 "${RP_CONSOLE_COMMAND}"
+    fi
+    if [[ -f "${backup}/rp-console-apply.sudoers" ]]; then
+        cp -a "${backup}/rp-console-apply.sudoers" "${RP_CONSOLE_SUDOERS}"
+        chmod 0440 "${RP_CONSOLE_SUDOERS}"
     fi
     if [[ -f "${backup}/nginx-enabled" ]]; then
         ln -s "${RP_CONSOLE_NGINX_SITE}" "${RP_CONSOLE_NGINX_ENABLED}"

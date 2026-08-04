@@ -514,3 +514,13 @@ https://raw.githubusercontent.com/cchu40558-collab/RP-Console/vX.Y.Z/scripts/ins
 12. 待完成：验证总站自身升级和回退后，再接入其余子站。
 
 在第 8 步完成前，不应在生产服务器上尝试从 GitHub 克隆后手工拼装服务，也不应执行文中标记为“未来”的安装命令。
+
+## 17. v2.0.19 站点设置改造
+
+`v2.0.19` 起，首次安装不再要求把 Cloudflare Origin Certificate 和私钥先上传到 SSH 目录。安装命令仍必须提供域名和指定的 Git tag，但安装器会生成仅用于引导的短期自签名源站证书。
+
+首次登录前仍必须人工完成两项外部配置：Cloudflare DNS 记录，以及云厂商防火墙的 TCP `80/443` 放行。Cloudflare SSL/TLS 先使用 `Full`，登录 RP Console 后在“站点设置”填写域名、上传匹配的 Origin Certificate 和私钥，点击“保存并应用”。
+
+页面应用动作会验证 PEM、证书私钥配对、域名 SAN 和有效期；再由固定的 root 配置助手原子更新 RP Console 自己的 TLS 文件和 Nginx 站点配置，执行 `nginx -t` 和 reload，并在 UFW 已启用时确保 `80/443` 放行。失败时恢复原证书、私钥和 Nginx 文件；上传到临时目录的私钥会被删除，不会保留在总站应用数据中。成功后将 Cloudflare 切换为 `Full (strict)`。
+
+总站服务本身继续使用专用的 `rp-console` 系统用户运行。网页不是 root 终端：它只能经由 sudoers 中严格限定的、无参数的 `/usr/local/lib/rp-console/apply-site` 调用配置助手，不能执行任意命令，也不能改写其他 Nginx 站点或开放 `2053`。

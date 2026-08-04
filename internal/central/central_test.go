@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"relay-central/internal/config"
 )
@@ -39,5 +40,52 @@ func TestHealthzReturnsEmbeddedVersion(t *testing.T) {
 	}
 	if response.Version != config.Version {
 		t.Errorf("version = %q, want embedded version %q", response.Version, config.Version)
+	}
+}
+
+func TestSiteSettingsRequireLoginAndExposeHelperAvailability(t *testing.T) {
+	app, err := New(Config{
+		DataDir:         t.TempDir(),
+		AdminPassword:   "test-password",
+		MasterKey:       base64.RawStdEncoding.EncodeToString(make([]byte, 32)),
+		PrivilegedApply: "/usr/local/lib/rp-console/apply-site",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	unauthenticated := httptest.NewRecorder()
+	app.Handler().ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/api/site", nil))
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated site status = %d, want %d", unauthenticated.Code, http.StatusUnauthorized)
+	}
+
+	app.sessions["test-session"] = time.Now().Add(time.Hour)
+	request := httptest.NewRequest(http.MethodGet, "/api/site", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookie, Value: "test-session"})
+	recorder := httptest.NewRecorder()
+	app.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("authenticated site status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var response siteView
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.CanApply {
+		t.Error("CanApply = false, want true when the configured helper is available")
+	}
+}
+
+func TestValidateSiteDomain(t *testing.T) {
+	for _, value := range []string{"rp-console.wakeup-ai.top", "RP-CONSOLE.EXAMPLE.COM"} {
+		if _, err := validateSiteDomain(value); err != nil {
+			t.Errorf("validateSiteDomain(%q) error = %v", value, err)
+		}
+	}
+	for _, value := range []string{"localhost", "https://example.com", "bad_name.example.com", "-bad.example.com"} {
+		if _, err := validateSiteDomain(value); err == nil {
+			t.Errorf("validateSiteDomain(%q) succeeded, want error", value)
+		}
 	}
 }

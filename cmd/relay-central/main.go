@@ -25,6 +25,7 @@ func main() {
 		AdminPassword:     password,
 		MasterKey:         key,
 		AllowPrivateNodes: allowPrivate,
+		PrivilegedApply:   os.Getenv("CENTRAL_PRIVILEGED_APPLY"),
 	})
 	if err != nil {
 		log.Fatal(err)

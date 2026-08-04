@@ -13,18 +13,18 @@ It intentionally does **not** yet provide remote line mutation, mTLS enrollment,
 
 ## Server deployment
 
-The first deployment-automation release is `v2.0.18`. It installs only RP Console itself: it does not install Xray or create proxy lines.
+The next deployment-automation release is `v2.0.19`. It installs only RP Console itself: it does not install Xray or create proxy lines.
 
-Before the first installation, create the Cloudflare DNS record and upload the matching Origin Certificate and private key to temporary server paths. After `v2.0.18` is released, run as root or through `sudo`:
+Before the first installation, create the Cloudflare DNS record and open TCP `80` and `443` in the cloud-provider firewall. Set Cloudflare SSL/TLS to `Full` temporarily. The installer creates a short-lived self-signed origin certificate so that the administrator can finish TLS setup in the web panel. Run as root or through `sudo`:
 
 ```bash
 sudo env \
-  CONSOLE_REPO_REF=v2.0.18 \
+  CONSOLE_REPO_REF=v2.0.19 \
   CONSOLE_DOMAIN=rp-console.wakeup-ai.top \
-  CONSOLE_TLS_CERT_FILE=/root/rp-console-origin.crt \
-  CONSOLE_TLS_KEY_FILE=/root/rp-console-origin.key \
-  bash <(curl -fsSL https://raw.githubusercontent.com/cchu40558-collab/RP-Console/v2.0.18/scripts/install-server.sh)
+  bash <(curl -fsSL https://raw.githubusercontent.com/cchu40558-collab/RP-Console/v2.0.19/scripts/install-server.sh)
 ```
+
+After signing in, open **Site settings**, enter the domain, upload the Cloudflare Origin Certificate and matching private key, then choose **Save and apply**. RP Console validates the pair, atomically replaces only its own Nginx TLS configuration, reloads Nginx, and opens UFW ports `80/443` when UFW is active. It does not expose port `2053`. After the panel reports success, change Cloudflare SSL/TLS to `Full (strict)`.
 
 The installer creates a loopback-only service on `127.0.0.1:2053`, configures Nginx HTTPS, writes root-only credentials to `/root/rp-console-install-result.env`, and provides:
 
@@ -76,7 +76,7 @@ Open `http://127.0.0.1:2053`.
 ## Production requirements
 
 - Bind RP Console to `127.0.0.1:2053` and use Nginx on port 443.
-- Put `rp-console.wakeup-ai.top` behind Cloudflare with Full (strict) TLS and Cloudflare Access.
+- Put `rp-console.wakeup-ai.top` behind Cloudflare with Full (strict) TLS and Cloudflare Access after the Origin Certificate has been applied.
 - Store `CENTRAL_ADMIN_PASSWORD` and `CENTRAL_MASTER_KEY` in a root-readable systemd environment file with mode `0600`.
 - Do not change `CENTRAL_MASTER_KEY` after registering servers; doing so makes stored API Tokens unreadable.
 - Child management endpoints must use HTTPS and a dedicated central read-only token; mTLS enrollment is a later required phase.
