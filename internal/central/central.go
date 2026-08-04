@@ -26,19 +26,22 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"relay-central/internal/config"
 )
 
 //go:embed static/*
 var staticFiles embed.FS
 
 const (
-	Version          = "0.1.0"
 	apiPrefix        = "/api"
 	sessionCookie    = "relay_central_session"
 	sessionLifetime  = 12 * time.Hour
 	probeTimeout     = 8 * time.Second
 	backgroundPeriod = 30 * time.Second
 )
+
+var Version = config.Version
 
 type Config struct {
 	DataDir           string

@@ -11,6 +11,30 @@ RP Console is the first runnable phase of the Relay Panel central site. It is a 
 
 It intentionally does **not** yet provide remote line mutation, mTLS enrollment, or remote upgrade/rollback. Those operations must not be exposed before a separate node-side controlled write API exists.
 
+## Server deployment
+
+The first deployment-automation release is `v2.0.18`. It installs only RP Console itself: it does not install Xray or create proxy lines.
+
+Before the first installation, create the Cloudflare DNS record and upload the matching Origin Certificate and private key to temporary server paths. After `v2.0.18` is released, run as root or through `sudo`:
+
+```bash
+sudo env \
+  CONSOLE_REPO_REF=v2.0.18 \
+  CONSOLE_DOMAIN=rp-console.wakeup-ai.top \
+  CONSOLE_TLS_CERT_FILE=/root/rp-console-origin.crt \
+  CONSOLE_TLS_KEY_FILE=/root/rp-console-origin.key \
+  bash <(curl -fsSL https://raw.githubusercontent.com/cchu40558-collab/RP-Console/v2.0.18/scripts/install-server.sh)
+```
+
+The installer creates a loopback-only service on `127.0.0.1:2053`, configures Nginx HTTPS, writes root-only credentials to `/root/rp-console-install-result.env`, and provides:
+
+```text
+rp-console version | status | logs
+sudo rp-console check | restart | update vX.Y.Z | rollback | backups | password
+```
+
+The initial installation also requires Google Cloud VPC firewall rules for TCP `80` and `443`. The installer configures UFW only; it cannot change Google Cloud firewall rules.
+
 ## Child-panel requirements
 
 The child must run Relay Panel `v2.0.18` or later. In the child panel, open **Settings > Security > Central access**, create a central read-only token, and copy it immediately. The plaintext token is shown only once.
@@ -52,7 +76,7 @@ Open `http://127.0.0.1:2053`.
 ## Production requirements
 
 - Bind RP Console to `127.0.0.1:2053` and use Nginx on port 443.
-- Put `admin.wakeup-ai.top` behind Cloudflare with Full (strict) TLS and Cloudflare Access.
+- Put `rp-console.wakeup-ai.top` behind Cloudflare with Full (strict) TLS and Cloudflare Access.
 - Store `CENTRAL_ADMIN_PASSWORD` and `CENTRAL_MASTER_KEY` in a root-readable systemd environment file with mode `0600`.
 - Do not change `CENTRAL_MASTER_KEY` after registering servers; doing so makes stored API Tokens unreadable.
 - Child management endpoints must use HTTPS and a dedicated central read-only token; mTLS enrollment is a later required phase.
