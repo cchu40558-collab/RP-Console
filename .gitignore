@@ -1,5 +1,5 @@
-relay-central
-relay-central.exe
+rp-console
+rp-console.exe
 data/
 .env
 *.log

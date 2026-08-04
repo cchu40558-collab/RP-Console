@@ -32,6 +32,7 @@ import (
 var staticFiles embed.FS
 
 const (
+	Version          = "0.1.0"
 	apiPrefix        = "/api"
 	sessionCookie    = "relay_central_session"
 	sessionLifetime  = 12 * time.Hour
@@ -289,7 +290,7 @@ func (s *store) decrypt(value string) (string, error) {
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": Version})
 	})
 	mux.HandleFunc("POST /api/login", a.login)
 	mux.HandleFunc("POST /api/logout", a.requireAuth(a.logout))
