@@ -76,7 +76,8 @@ maintenance_snapshot_current() {
         : > "${destination}/nginx-enabled"
     fi
     printf '%s\n' "${label}" > "${destination}/LABEL"
-    chmod -R go-rwx "${destination}"
+    # The backup root is private. Preserve the original executable modes inside
+    # it so restoring a snapshot cannot make the service binary root-only.
     printf '%s\n' "${destination}"
 }
 
@@ -117,6 +118,7 @@ maintenance_restore_snapshot() {
     fi
 
     chown -R rp-console:rp-console "${RP_CONSOLE_DATA_DIR}"
+	chmod 0755 "${RP_CONSOLE_APP_DIR}" "${RP_CONSOLE_APP_DIR}/rp-console"
     chmod 0700 "${RP_CONSOLE_DATA_DIR}"
     chmod 0600 "${RP_CONSOLE_ENV_DIR}/rp-console.env"
     chmod 0600 "${RP_CONSOLE_ENV_DIR}/tls/origin.key"
