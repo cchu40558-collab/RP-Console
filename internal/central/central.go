@@ -101,6 +101,7 @@ type serverView struct {
 	Scheme        string    `json:"scheme"`
 	Port          int       `json:"port"`
 	BasePath      string    `json:"basePath"`
+	PanelURL      string    `json:"panelUrl,omitempty"`
 	ValidFrom     string    `json:"validFrom"`
 	ValidUntil    string    `json:"validUntil"`
 	Status        string    `json:"status"`
@@ -197,21 +198,6 @@ type serverInput struct {
 	ValidFrom  string `json:"validFrom"`
 	ValidUntil string `json:"validUntil"`
 	APIToken   string `json:"apiToken"`
-}
-
-type remoteLine struct {
-	ID                     int    `json:"id"`
-	Name                   string `json:"name"`
-	Type                   string `json:"type"`
-	Status                 string `json:"status"`
-	LastError              string `json:"lastError"`
-	ValidFrom              int64  `json:"validFrom"`
-	ValidUntil             int64  `json:"validUntil"`
-	ManualReenableRequired bool   `json:"manualReenableRequired"`
-	TotalTraffic           int64  `json:"totalTraffic"`
-	InboundLatencyMS       int64  `json:"inboundLatencyMs"`
-	OutboundLatencyMS      int64  `json:"outboundLatencyMs"`
-	LastCheckedAt          int64  `json:"lastCheckedAt"`
 }
 
 type remoteCapabilities struct {
@@ -367,7 +353,6 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/servers", a.requireAuth(a.createServer))
 	mux.HandleFunc("PATCH /api/servers/{id}", a.requireAuth(a.updateServer))
 	mux.HandleFunc("POST /api/servers/{id}/probe", a.requireAuth(a.probeServer))
-	mux.HandleFunc("GET /api/servers/{id}/lines", a.requireAuth(a.listRemoteLines))
 	mux.HandleFunc("GET /api/events", a.requireAuth(a.listEvents))
 	mux.HandleFunc("/", a.static)
 	return securityHeaders(mux)
@@ -384,7 +369,7 @@ func securityHeaders(next http.Handler) http.Handler {
 }
 
 func (a *App) static(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" && r.URL.Path != "/index.html" && !isServerPanelPath(r.URL.Path) {
+	if r.URL.Path != "/" && r.URL.Path != "/index.html" {
 		http.NotFound(w, r)
 		return
 	}
@@ -401,11 +386,6 @@ func (a *App) static(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; style-src 'nonce-"+nonce+"'; script-src 'nonce-"+nonce+"'")
 	_, _ = w.Write([]byte(strings.ReplaceAll(string(raw), "{{NONCE}}", nonce)))
-}
-
-func isServerPanelPath(value string) bool {
-	parts := strings.Split(strings.Trim(value, "/"), "/")
-	return len(parts) == 3 && parts[0] == "servers" && parts[1] != "" && parts[2] == "panel"
 }
 
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
@@ -712,7 +692,7 @@ func (a *App) createServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	record := serverRecord{ID: id, Name: strings.TrimSpace(input.Name), Address: strings.TrimSpace(input.Address), Scheme: input.Scheme, Port: input.Port, BasePath: cleanBasePath(input.BasePath), ValidFrom: input.ValidFrom, ValidUntil: input.ValidUntil, TokenCiphertext: ciphertext, Status: "unknown", CreatedAt: now, UpdatedAt: now}
+	record := serverRecord{ID: id, Name: input.Name, Address: input.Address, Scheme: input.Scheme, Port: input.Port, BasePath: input.BasePath, ValidFrom: input.ValidFrom, ValidUntil: input.ValidUntil, TokenCiphertext: ciphertext, Status: "unknown", CreatedAt: now, UpdatedAt: now}
 	if err := a.store.add(record); err != nil {
 		writeError(w, http.StatusInternalServerError, "save server")
 		return
@@ -784,24 +764,6 @@ func (a *App) probeServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"server": updated.toView()})
 }
 
-func (a *App) listRemoteLines(w http.ResponseWriter, r *http.Request) {
-	record, err := a.store.get(r.PathValue("id"))
-	if errors.Is(err, errNotFound) {
-		writeError(w, http.StatusNotFound, "server not found")
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "load server")
-		return
-	}
-	lines, err := a.fetchRemoteLines(record)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"server": record.toView(), "lines": lines})
-}
-
 func (a *App) listEvents(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"events": a.store.events()})
 }
@@ -861,30 +823,6 @@ func (a *App) probe(record serverRecord) serverRecord {
 	record.Status = recordStatus(record)
 	record.UpdatedAt = record.LastHeartbeat
 	return record
-}
-
-func (a *App) fetchRemoteLines(record serverRecord) ([]map[string]any, error) {
-	token, err := a.store.decrypt(record.TokenCiphertext)
-	if err != nil || token == "" {
-		return nil, errors.New("无法读取子站 API 凭据")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-	defer cancel()
-	var lines []remoteLine
-	if _, err := a.request(ctx, record, token, "central/lines", &lines); err != nil {
-		return nil, fmt.Errorf("读取子站线路失败：%w", err)
-	}
-	result := make([]map[string]any, 0, len(lines))
-	for _, line := range lines {
-		result = append(result, map[string]any{
-			"id": line.ID, "name": line.Name, "type": line.Type, "status": line.Status,
-			"lastError": line.LastError,
-			"validFrom": line.ValidFrom, "validUntil": line.ValidUntil, "manualReenableRequired": line.ManualReenableRequired,
-			"totalTraffic": line.TotalTraffic, "inboundLatencyMs": line.InboundLatencyMS,
-			"outboundLatencyMs": line.OutboundLatencyMS, "lastCheckedAt": line.LastCheckedAt,
-		})
-	}
-	return result, nil
 }
 
 func failedProbe(record serverRecord, reason string) serverRecord {
@@ -965,8 +903,41 @@ func nodeURL(record serverRecord, endpoint string) (string, error) {
 	if strings.Contains(record.Address, ":") && net.ParseIP(record.Address) != nil {
 		u.Host = net.JoinHostPort(record.Address, strconv.Itoa(record.Port))
 	}
-	u.Path = path.Join(cleanBasePath(record.BasePath), "panel", "api", endpoint)
+	basePath, err := normalizeBasePath(record.BasePath)
+	if err != nil {
+		return "", err
+	}
+	u.Path = path.Join(basePath, "panel", "api", endpoint)
 	return u.String(), nil
+}
+
+// managementPanelURL is intentionally separate from nodeURL: it is a browser
+// navigation target, while nodeURL addresses the node's read-only API.
+func managementPanelURL(record serverRecord) (string, error) {
+	host, err := normalizeManagementDomain(record.Address)
+	if err != nil {
+		return "", err
+	}
+	if strings.ToLower(strings.TrimSpace(record.Scheme)) != "https" {
+		return "", errors.New("node management panel must use HTTPS")
+	}
+	if record.Port < 1 || record.Port > 65535 {
+		return "", errors.New("invalid node port")
+	}
+	basePath, err := normalizeBasePath(record.BasePath)
+	if err != nil {
+		return "", err
+	}
+	if basePath == "" {
+		basePath = "/"
+	} else {
+		basePath += "/"
+	}
+	return (&url.URL{
+		Scheme: "https",
+		Host:   net.JoinHostPort(host, strconv.Itoa(record.Port)),
+		Path:   basePath,
+	}).String(), nil
 }
 
 func validateInput(input *serverInput) error {
@@ -979,6 +950,11 @@ func validateInput(input *serverInput) error {
 	if input.Address == "" || len(input.Address) > 253 {
 		return errors.New("请输入有效的管理地址")
 	}
+	address, err := normalizeManagementDomain(input.Address)
+	if err != nil {
+		return err
+	}
+	input.Address = address
 	if input.Scheme != "https" {
 		return errors.New("子站管理连接必须使用 HTTPS")
 	}
@@ -988,6 +964,11 @@ func validateInput(input *serverInput) error {
 	if input.ValidFrom == "" {
 		return errors.New("请填写服务器有效期起始日期")
 	}
+	basePath, err := normalizeBasePath(input.BasePath)
+	if err != nil {
+		return err
+	}
+	input.BasePath = basePath
 	from, err := time.Parse("2006-01-02", input.ValidFrom)
 	if err != nil {
 		return errors.New("起始日期必须为 YYYY-MM-DD")
@@ -1002,6 +983,28 @@ func validateInput(input *serverInput) error {
 		return errors.New("API Token 过长")
 	}
 	return nil
+}
+
+func normalizeManagementDomain(value string) (string, error) {
+	host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(value)), ".")
+	if host == "" || len(host) > 253 || net.ParseIP(host) != nil {
+		return "", errors.New("子站管理地址必须填写证书对应的域名，不能使用 IP")
+	}
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return "", errors.New("子站管理地址必须填写完整域名")
+	}
+	for _, label := range labels {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", errors.New("请输入有效的管理域名")
+		}
+		for _, r := range label {
+			if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-') {
+				return "", errors.New("请输入有效的管理域名")
+			}
+		}
+	}
+	return host, nil
 }
 
 func validateRemoteHost(host string, allowPrivate bool) error {
@@ -1037,12 +1040,26 @@ func validateIP(ip netip.Addr, allowPrivate bool) error {
 	return nil
 }
 
-func cleanBasePath(value string) string {
+func normalizeBasePath(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" || value == "/" {
-		return ""
+		return "", nil
 	}
-	return "/" + strings.Trim(value, "/")
+	if strings.ContainsAny(value, "\\\\?#%") {
+		return "", errors.New("管理基础路径不能包含查询参数、片段或转义字符")
+	}
+	segments := strings.Split(strings.Trim(value, "/"), "/")
+	for _, segment := range segments {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", errors.New("管理基础路径格式无效")
+		}
+		for _, r := range segment {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("-._~", r)) {
+				return "", errors.New("管理基础路径只能包含字母、数字和 -._~")
+			}
+		}
+	}
+	return "/" + strings.Join(segments, "/"), nil
 }
 
 func (s *store) add(record serverRecord) error {
@@ -1083,8 +1100,8 @@ func (s *store) update(id string, input serverInput) (serverRecord, error) {
 			}
 		}
 		record := &s.state.Servers[i]
-		record.Name, record.Address, record.Scheme, record.Port = strings.TrimSpace(input.Name), strings.TrimSpace(input.Address), input.Scheme, input.Port
-		record.BasePath, record.ValidFrom, record.ValidUntil = cleanBasePath(input.BasePath), input.ValidFrom, input.ValidUntil
+		record.Name, record.Address, record.Scheme, record.Port = input.Name, input.Address, input.Scheme, input.Port
+		record.BasePath, record.ValidFrom, record.ValidUntil = input.BasePath, input.ValidFrom, input.ValidUntil
 		if input.APIToken != "" {
 			ciphertext, err := s.encrypt(input.APIToken)
 			if err != nil {
@@ -1241,7 +1258,8 @@ func (s *store) recoverInterruptedSiteApply() bool {
 }
 
 func (r serverRecord) toView() serverView {
-	return serverView{ID: r.ID, Name: r.Name, Address: r.Address, Scheme: r.Scheme, Port: r.Port, BasePath: r.BasePath, ValidFrom: r.ValidFrom, ValidUntil: r.ValidUntil, Status: r.Status, LatencyMS: r.LatencyMS, TotalTraffic: r.TotalTraffic, PanelVersion: r.PanelVersion, XrayState: r.XrayState, LineCount: r.LineCount, AbnormalCount: r.AbnormalCount, LastError: r.LastError, LastHeartbeat: r.LastHeartbeat}
+	panelURL, _ := managementPanelURL(r)
+	return serverView{ID: r.ID, Name: r.Name, Address: r.Address, Scheme: r.Scheme, Port: r.Port, BasePath: r.BasePath, PanelURL: panelURL, ValidFrom: r.ValidFrom, ValidUntil: r.ValidUntil, Status: r.Status, LatencyMS: r.LatencyMS, TotalTraffic: r.TotalTraffic, PanelVersion: r.PanelVersion, XrayState: r.XrayState, LineCount: r.LineCount, AbnormalCount: r.AbnormalCount, LastError: r.LastError, LastHeartbeat: r.LastHeartbeat}
 }
 
 func decodeJSON(r *http.Request, target any) error {

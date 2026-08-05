@@ -129,3 +129,63 @@ func TestSiteApplyJobLifecyclePreservesPreviousSiteUntilSuccess(t *testing.T) {
 		t.Fatalf("success view = %+v, want updated site and succeeded job", view)
 	}
 }
+
+func TestManagementPanelURLUsesNormalizedHTTPSDomainAndBasePath(t *testing.T) {
+	record := serverRecord{
+		Address:  "RP2.WAKEUP-AI.TOP.",
+		Scheme:   "HTTPS",
+		Port:     2083,
+		BasePath: " /manage/token/ ",
+	}
+
+	got, err := managementPanelURL(record)
+	if err != nil {
+		t.Fatalf("managementPanelURL() error = %v", err)
+	}
+	if want := "https://rp2.wakeup-ai.top:2083/manage/token/"; got != want {
+		t.Errorf("managementPanelURL() = %q, want %q", got, want)
+	}
+}
+
+func TestManagementPanelURLRejectsUnsafeOrCertificateIncompatibleTargets(t *testing.T) {
+	for _, record := range []serverRecord{
+		{Address: "153.75.235.141", Scheme: "https", Port: 2083},
+		{Address: "rp2.wakeup-ai.top", Scheme: "http", Port: 2083},
+		{Address: "rp2.wakeup-ai.top", Scheme: "https", Port: 2083, BasePath: "/safe?next=bad"},
+	} {
+		if got, err := managementPanelURL(record); err == nil || got != "" {
+			t.Errorf("managementPanelURL(%+v) = %q, %v; want rejected target", record, got, err)
+		}
+	}
+}
+
+func TestServerViewOmitsPanelURLForLegacyIPAddressRecord(t *testing.T) {
+	view := (serverRecord{Address: "153.75.235.141", Scheme: "https", Port: 2083}).toView()
+	if view.PanelURL != "" {
+		t.Errorf("PanelURL = %q, want empty for legacy IP record", view.PanelURL)
+	}
+}
+
+func TestRemovedRemotePanelRoutesReturnNotFound(t *testing.T) {
+	app, err := New(Config{
+		DataDir:       t.TempDir(),
+		AdminPassword: "test-password",
+		MasterKey:     base64.RawStdEncoding.EncodeToString(make([]byte, 32)),
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	for _, route := range []string{"/servers/server-1/panel", "/api/servers/server-1/lines"} {
+		req := httptest.NewRequest(http.MethodGet, route, nil)
+		if route[0:4] == "/api" {
+			app.sessions["test-session"] = time.Now().Add(time.Hour)
+			req.AddCookie(&http.Cookie{Name: sessionCookie, Value: "test-session"})
+		}
+		recorder := httptest.NewRecorder()
+		app.Handler().ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusNotFound {
+			t.Errorf("GET %s status = %d, want %d", route, recorder.Code, http.StatusNotFound)
+		}
+	}
+}
