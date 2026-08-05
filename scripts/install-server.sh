@@ -235,9 +235,10 @@ ProtectSystem=strict
 # The web service writes only its data directory. Its single sudo-whitelisted
 # helper additionally needs these fixed paths to replace the site's TLS files,
 # Nginx vhost, and its own UFW web-port rules. UFW creates /run/ufw.lock while
-# reading or changing rules, so its runtime lock directory must be writable too.
+# reading or changing rules, and `nginx -t` opens the configured log files.
+# Their runtime and log paths must be writable for this fixed helper to work.
 # The web service itself still runs as the unprivileged rp-console user.
-ReadWritePaths=${DATA_DIR} ${ENV_DIR} /etc/nginx/sites-available /etc/ufw /run
+ReadWritePaths=${DATA_DIR} ${ENV_DIR} /etc/nginx/sites-available /etc/ufw /run /var/log/nginx
 
 [Install]
 WantedBy=multi-user.target
