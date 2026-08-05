@@ -57,17 +57,22 @@ type Config struct {
 }
 
 type App struct {
-	store             *store
-	adminPassword     string
-	allowPrivateNodes bool
-	sessions          map[string]time.Time
-	sessionMu         sync.Mutex
-	httpClient        *http.Client
-	dataDir           string
-	privilegedApply   string
-	siteApplyMu       sync.Mutex
-	siteApplyRunning  bool
+	store              *store
+	adminPassword      string
+	allowPrivateNodes  bool
+	sessions           map[string]time.Time
+	sessionMu          sync.Mutex
+	httpClient         *http.Client
+	dataDir            string
+	privilegedApply    string
+	siteApplyMu        sync.Mutex
+	siteApplyRunning   bool
 	runSiteApply       func(context.Context, string) ([]byte, error)
+	serverStateMu      sync.Mutex
+	refreshMu          sync.RWMutex
+	refresh            *refreshOperation
+	deleteMu           sync.Mutex
+	deletePreparations map[string]deletePreparation
 }
 
 type serverRecord struct {
@@ -105,7 +110,6 @@ type serverView struct {
 	ValidFrom     string    `json:"validFrom"`
 	ValidUntil    string    `json:"validUntil"`
 	Status        string    `json:"status"`
-	LatencyMS     int64     `json:"latencyMs"`
 	TotalTraffic  int64     `json:"totalTraffic"`
 	PanelVersion  string    `json:"panelVersion"`
 	XrayState     string    `json:"xrayState"`
@@ -113,6 +117,29 @@ type serverView struct {
 	AbnormalCount int       `json:"abnormalCount"`
 	LastError     string    `json:"lastError"`
 	LastHeartbeat time.Time `json:"lastHeartbeat"`
+}
+
+type refreshOperation struct {
+	ID               string    `json:"id"`
+	Status           string    `json:"status"`
+	TotalServers     int       `json:"totalServers"`
+	CompletedServers int       `json:"completedServers"`
+	FailedServers    int       `json:"failedServers"`
+	CreatedAt        time.Time `json:"createdAt"`
+	StartedAt        time.Time `json:"startedAt"`
+	FinishedAt       time.Time `json:"finishedAt"`
+}
+
+type deleteRequest struct {
+	IDs            []string `json:"ids"`
+	ConfirmationID string   `json:"confirmationId"`
+}
+
+type deletePreparation struct {
+	ID        string
+	SessionID string
+	ServerIDs []string
+	ExpiresAt time.Time
 }
 
 type event struct {
@@ -142,33 +169,33 @@ type siteConfig struct {
 }
 
 type siteView struct {
-	Domain            string    `json:"domain"`
-	CertificateSHA256 string    `json:"certificateSha256"`
-	CertificateExpiry time.Time `json:"certificateExpiry"`
-	AppliedAt         time.Time `json:"appliedAt"`
-	CanApply          bool      `json:"canApply"`
+	Domain            string           `json:"domain"`
+	CertificateSHA256 string           `json:"certificateSha256"`
+	CertificateExpiry time.Time        `json:"certificateExpiry"`
+	AppliedAt         time.Time        `json:"appliedAt"`
+	CanApply          bool             `json:"canApply"`
 	Job               siteApplyJobView `json:"job"`
 }
 
 type siteApplyJob struct {
-	ID        string    `json:"id"`
-	Domain    string    `json:"domain"`
-	Status    string    `json:"status"`
-	Stage     string    `json:"stage"`
-	Message   string    `json:"message"`
-	CreatedAt time.Time `json:"createdAt"`
-	StartedAt time.Time `json:"startedAt"`
+	ID         string    `json:"id"`
+	Domain     string    `json:"domain"`
+	Status     string    `json:"status"`
+	Stage      string    `json:"stage"`
+	Message    string    `json:"message"`
+	CreatedAt  time.Time `json:"createdAt"`
+	StartedAt  time.Time `json:"startedAt"`
 	FinishedAt time.Time `json:"finishedAt"`
 }
 
 type siteApplyJobView struct {
-	ID        string    `json:"id"`
-	Domain    string    `json:"domain"`
-	Status    string    `json:"status"`
-	Stage     string    `json:"stage"`
-	Message   string    `json:"message"`
-	CreatedAt time.Time `json:"createdAt"`
-	StartedAt time.Time `json:"startedAt"`
+	ID         string    `json:"id"`
+	Domain     string    `json:"domain"`
+	Status     string    `json:"status"`
+	Stage      string    `json:"stage"`
+	Message    string    `json:"message"`
+	CreatedAt  time.Time `json:"createdAt"`
+	StartedAt  time.Time `json:"startedAt"`
 	FinishedAt time.Time `json:"finishedAt"`
 }
 
@@ -245,13 +272,14 @@ func New(cfg Config) (*App, error) {
 		return nil, err
 	}
 	a := &App{
-		store:             s,
-		adminPassword:     cfg.AdminPassword,
-		allowPrivateNodes: cfg.AllowPrivateNodes,
-		dataDir:           cfg.DataDir,
-		privilegedApply:   strings.TrimSpace(cfg.PrivilegedApply),
-		runSiteApply:      runPrivilegedSiteApply,
-		sessions:          make(map[string]time.Time),
+		store:              s,
+		adminPassword:      cfg.AdminPassword,
+		allowPrivateNodes:  cfg.AllowPrivateNodes,
+		dataDir:            cfg.DataDir,
+		privilegedApply:    strings.TrimSpace(cfg.PrivilegedApply),
+		runSiteApply:       runPrivilegedSiteApply,
+		sessions:           make(map[string]time.Time),
+		deletePreparations: make(map[string]deletePreparation),
 		httpClient: &http.Client{
 			Timeout: probeTimeout,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -352,7 +380,10 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /api/servers", a.requireAuth(a.listServers))
 	mux.HandleFunc("POST /api/servers", a.requireAuth(a.createServer))
 	mux.HandleFunc("PATCH /api/servers/{id}", a.requireAuth(a.updateServer))
-	mux.HandleFunc("POST /api/servers/{id}/probe", a.requireAuth(a.probeServer))
+	mux.HandleFunc("POST /api/servers/delete-preparation", a.requireAuth(a.prepareDeleteServers))
+	mux.HandleFunc("DELETE /api/servers", a.requireAuth(a.deleteServers))
+	mux.HandleFunc("POST /api/operations/refresh", a.requireAuth(a.startRefresh))
+	mux.HandleFunc("GET /api/operations/current", a.requireAuth(a.currentRefresh))
 	mux.HandleFunc("GET /api/events", a.requireAuth(a.listEvents))
 	mux.HandleFunc("/", a.static)
 	return securityHeaders(mux)
@@ -385,7 +416,8 @@ func (a *App) static(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; style-src 'nonce-"+nonce+"'; script-src 'nonce-"+nonce+"'")
-	_, _ = w.Write([]byte(strings.ReplaceAll(string(raw), "{{NONCE}}", nonce)))
+	page := strings.ReplaceAll(string(raw), "{{NONCE}}", nonce)
+	_, _ = w.Write([]byte(strings.ReplaceAll(page, "{{VERSION}}", Version)))
 }
 
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
@@ -681,6 +713,12 @@ func (a *App) createServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	a.serverStateMu.Lock()
+	defer a.serverStateMu.Unlock()
+	if a.refreshActive() {
+		writeError(w, http.StatusConflict, "刷新进行中，暂时不能添加服务器")
+		return
+	}
 	ciphertext, err := a.store.encrypt(input.APIToken)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "encrypt API token")
@@ -721,6 +759,12 @@ func (a *App) updateServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	a.serverStateMu.Lock()
+	defer a.serverStateMu.Unlock()
+	if a.refreshActive() {
+		writeError(w, http.StatusConflict, "刷新进行中，暂时不能编辑服务器")
+		return
+	}
 	updated, err := a.store.update(id, input)
 	if errors.Is(err, errNotFound) {
 		writeError(w, http.StatusNotFound, "server not found")
@@ -734,34 +778,115 @@ func (a *App) updateServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"server": updated.toView()})
 }
 
-func (a *App) probeServer(w http.ResponseWriter, r *http.Request) {
+func (a *App) startRefresh(w http.ResponseWriter, r *http.Request) {
 	if !sameOrigin(r) {
 		writeError(w, http.StatusForbidden, "invalid request origin")
 		return
 	}
-	id := r.PathValue("id")
-	record, err := a.store.get(id)
+	operation, started, err := a.beginRefresh()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "创建刷新任务失败")
+		return
+	}
+	if !started {
+		writeJSON(w, http.StatusConflict, map[string]any{"operation": operation})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"operation": operation})
+}
+
+func (a *App) currentRefresh(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"operation": a.refreshView()})
+}
+
+func (a *App) prepareDeleteServers(w http.ResponseWriter, r *http.Request) {
+	if !sameOrigin(r) {
+		writeError(w, http.StatusForbidden, "invalid request origin")
+		return
+	}
+	var request deleteRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ids, err := normalizeServerIDs(request.IDs)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	a.serverStateMu.Lock()
+	defer a.serverStateMu.Unlock()
+	if a.refreshActive() {
+		writeError(w, http.StatusConflict, "刷新进行中，暂时不能删除服务器")
+		return
+	}
+	servers, err := a.store.getMany(ids)
 	if errors.Is(err, errNotFound) {
-		writeError(w, http.StatusNotFound, "server not found")
+		writeError(w, http.StatusNotFound, "部分服务器不存在，请刷新列表后重试")
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "load server")
+		writeError(w, http.StatusInternalServerError, "读取待删除服务器失败")
 		return
 	}
-	updated := a.probe(record)
-	if err := a.store.replace(updated); err != nil {
-		writeError(w, http.StatusInternalServerError, "save probe result")
+	confirmationID, err := a.createDeletePreparation(sessionToken(r), ids)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "创建删除确认失败")
 		return
 	}
-	level := "info"
-	message := "总站检测正常"
-	if updated.Status == "red" {
-		level = "error"
-		message = updated.LastError
+	items := make([]map[string]string, 0, len(servers))
+	for _, server := range servers {
+		items = append(items, map[string]string{"id": server.ID, "name": server.Name})
 	}
-	a.store.addEvent(updated, "probe", level, message)
-	writeJSON(w, http.StatusOK, map[string]any{"server": updated.toView()})
+	sort.Slice(items, func(i, j int) bool { return items[i]["name"] < items[j]["name"] })
+	writeJSON(w, http.StatusOK, map[string]any{"confirmationId": confirmationID, "servers": items, "expiresInSeconds": 60})
+}
+
+func (a *App) deleteServers(w http.ResponseWriter, r *http.Request) {
+	if !sameOrigin(r) {
+		writeError(w, http.StatusForbidden, "invalid request origin")
+		return
+	}
+	var request deleteRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ids, err := normalizeServerIDs(request.IDs)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if request.ConfirmationID == "" {
+		writeError(w, http.StatusBadRequest, "缺少第二次删除确认")
+		return
+	}
+	a.serverStateMu.Lock()
+	defer a.serverStateMu.Unlock()
+	if a.refreshActive() {
+		writeError(w, http.StatusConflict, "刷新进行中，暂时不能删除服务器")
+		return
+	}
+	if !a.consumeDeletePreparation(request.ConfirmationID, sessionToken(r), ids) {
+		writeError(w, http.StatusForbidden, "删除确认已过期或与当前选择不一致")
+		return
+	}
+	removed, err := a.store.removeMany(ids)
+	if errors.Is(err, errNotFound) {
+		writeError(w, http.StatusNotFound, "部分服务器不存在，请刷新列表后重试")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "删除服务器失败")
+		return
+	}
+	names := make([]string, 0, len(removed))
+	for _, server := range removed {
+		names = append(names, server.Name)
+	}
+	sort.Strings(names)
+	a.store.addEvent(serverRecord{Name: "RP Console"}, "servers-deleted", "info", fmt.Sprintf("已删除 %d 台服务器登记：%s", len(names), strings.Join(names, "、")))
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": len(removed)})
 }
 
 func (a *App) listEvents(w http.ResponseWriter, _ *http.Request) {
@@ -772,15 +897,127 @@ func (a *App) heartbeatLoop() {
 	ticker := time.NewTicker(backgroundPeriod)
 	defer ticker.Stop()
 	for range ticker.C {
+		if a.refreshActive() {
+			continue
+		}
 		for _, record := range a.store.records() {
-			updated := a.probe(record)
-			_ = a.store.replace(updated)
+			updated := a.syncServer(record)
+			a.serverStateMu.Lock()
+			if !a.refreshActive() {
+				_ = a.store.replace(updated)
+			}
+			a.serverStateMu.Unlock()
 		}
 	}
 }
 
-func (a *App) probe(record serverRecord) serverRecord {
-	started := time.Now()
+func (a *App) beginRefresh() (refreshOperation, bool, error) {
+	a.serverStateMu.Lock()
+	defer a.serverStateMu.Unlock()
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	if a.refresh != nil && (a.refresh.Status == "queued" || a.refresh.Status == "running") {
+		return *a.refresh, false, nil
+	}
+	id, err := randomID(12)
+	if err != nil {
+		return refreshOperation{}, false, err
+	}
+	records := a.store.records()
+	now := time.Now().UTC()
+	operation := &refreshOperation{ID: id, Status: "running", TotalServers: len(records), CreatedAt: now, StartedAt: now}
+	a.refresh = operation
+	go a.runRefresh(id, records)
+	return *operation, true, nil
+}
+
+func (a *App) runRefresh(id string, records []serverRecord) {
+	if len(records) == 0 {
+		a.completeRefresh(id, 0, 0)
+		return
+	}
+	sem := make(chan struct{}, 3)
+	var group sync.WaitGroup
+	for _, record := range records {
+		record := record
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			sem <- struct{}{}
+			updated := a.syncServer(record)
+			<-sem
+			a.serverStateMu.Lock()
+			_ = a.store.replace(updated)
+			a.serverStateMu.Unlock()
+			a.advanceRefresh(id, updated.Status == "red")
+		}()
+	}
+	group.Wait()
+	a.completeRefreshFromProgress(id)
+}
+
+func (a *App) advanceRefresh(id string, failed bool) {
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	if a.refresh == nil || a.refresh.ID != id || a.refresh.Status != "running" {
+		return
+	}
+	a.refresh.CompletedServers++
+	if failed {
+		a.refresh.FailedServers++
+	}
+}
+
+func (a *App) completeRefreshFromProgress(id string) {
+	a.refreshMu.Lock()
+	if a.refresh == nil || a.refresh.ID != id || a.refresh.Status != "running" {
+		a.refreshMu.Unlock()
+		return
+	}
+	completed, failed := a.refresh.CompletedServers, a.refresh.FailedServers
+	a.refreshMu.Unlock()
+	a.completeRefresh(id, completed, failed)
+}
+
+func (a *App) completeRefresh(id string, completed, failed int) {
+	a.refreshMu.Lock()
+	if a.refresh == nil || a.refresh.ID != id || a.refresh.Status != "running" {
+		a.refreshMu.Unlock()
+		return
+	}
+	a.refresh.CompletedServers = completed
+	a.refresh.FailedServers = failed
+	switch {
+	case failed == 0:
+		a.refresh.Status = "succeeded"
+	case failed == a.refresh.TotalServers:
+		a.refresh.Status = "failed"
+	default:
+		a.refresh.Status = "partial"
+	}
+	a.refresh.FinishedAt = time.Now().UTC()
+	operation := *a.refresh
+	a.refreshMu.Unlock()
+	a.store.addEvent(serverRecord{Name: "RP Console"}, "servers-refreshed", "info", fmt.Sprintf("已同步 %d 台服务器；成功 %d 台，异常 %d 台", operation.TotalServers, operation.TotalServers-operation.FailedServers, operation.FailedServers))
+}
+
+func (a *App) refreshActive() bool {
+	a.refreshMu.RLock()
+	defer a.refreshMu.RUnlock()
+	return a.refresh != nil && (a.refresh.Status == "queued" || a.refresh.Status == "running")
+}
+
+func (a *App) refreshView() any {
+	a.refreshMu.RLock()
+	defer a.refreshMu.RUnlock()
+	if a.refresh == nil {
+		return nil
+	}
+	view := *a.refresh
+	return view
+}
+
+func (a *App) syncServer(record serverRecord) serverRecord {
 	token, err := a.store.decrypt(record.TokenCiphertext)
 	if err != nil {
 		return failedProbe(record, "无法读取子站 API 凭据")
@@ -809,7 +1046,6 @@ func (a *App) probe(record serverRecord) serverRecord {
 	if summary.CentralProtocolVersion != 1 || summary.NodeID != capabilities.NodeID {
 		return failedProbe(record, "子站返回的摘要协议或节点标识不一致")
 	}
-	record.LatencyMS = time.Since(started).Milliseconds()
 	record.PanelVersion = summary.PanelVersion
 	record.XrayState = summary.Xray.State
 	record.LineCount = summary.Lines.Total
@@ -827,7 +1063,6 @@ func (a *App) probe(record serverRecord) serverRecord {
 
 func failedProbe(record serverRecord, reason string) serverRecord {
 	record.Status = "red"
-	record.LatencyMS = 0
 	record.LastError = reason
 	record.LastHeartbeat = time.Now().UTC()
 	record.UpdatedAt = record.LastHeartbeat
@@ -1062,6 +1297,73 @@ func normalizeBasePath(value string) (string, error) {
 	return "/" + strings.Join(segments, "/"), nil
 }
 
+func normalizeServerIDs(values []string) ([]string, error) {
+	if len(values) == 0 || len(values) > 100 {
+		return nil, errors.New("请选择 1 到 100 台服务器")
+	}
+	ids := append([]string(nil), values...)
+	for _, id := range ids {
+		if strings.TrimSpace(id) == "" || len(id) > 128 {
+			return nil, errors.New("服务器选择无效")
+		}
+	}
+	sort.Strings(ids)
+	for index := 1; index < len(ids); index++ {
+		if ids[index] == ids[index-1] {
+			return nil, errors.New("服务器选择重复")
+		}
+	}
+	return ids, nil
+}
+
+func sessionToken(r *http.Request) string {
+	cookie, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return ""
+	}
+	return cookie.Value
+}
+
+func (a *App) createDeletePreparation(sessionID string, serverIDs []string) (string, error) {
+	id, err := randomID(18)
+	if err != nil {
+		return "", err
+	}
+	now := time.Now()
+	a.deleteMu.Lock()
+	defer a.deleteMu.Unlock()
+	for key, preparation := range a.deletePreparations {
+		if now.After(preparation.ExpiresAt) {
+			delete(a.deletePreparations, key)
+		}
+	}
+	a.deletePreparations[id] = deletePreparation{ID: id, SessionID: sessionID, ServerIDs: append([]string(nil), serverIDs...), ExpiresAt: now.Add(time.Minute)}
+	return id, nil
+}
+
+func (a *App) consumeDeletePreparation(id, sessionID string, serverIDs []string) bool {
+	a.deleteMu.Lock()
+	defer a.deleteMu.Unlock()
+	preparation, ok := a.deletePreparations[id]
+	if !ok || time.Now().After(preparation.ExpiresAt) || preparation.SessionID != sessionID || !sameStringSlice(preparation.ServerIDs, serverIDs) {
+		return false
+	}
+	delete(a.deletePreparations, id)
+	return true
+}
+
+func sameStringSlice(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *store) add(record serverRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1085,6 +1387,24 @@ func (s *store) get(id string) (serverRecord, error) {
 		}
 	}
 	return serverRecord{}, errNotFound
+}
+
+func (s *store) getMany(ids []string) ([]serverRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	byID := make(map[string]serverRecord, len(s.state.Servers))
+	for _, record := range s.state.Servers {
+		byID[record.ID] = record
+	}
+	items := make([]serverRecord, 0, len(ids))
+	for _, id := range ids {
+		record, ok := byID[id]
+		if !ok {
+			return nil, errNotFound
+		}
+		items = append(items, record)
+	}
+	return items, nil
 }
 
 func (s *store) update(id string, input serverInput) (serverRecord, error) {
@@ -1128,6 +1448,34 @@ func (s *store) replace(updated serverRecord) error {
 		}
 	}
 	return errNotFound
+}
+
+func (s *store) removeMany(ids []string) ([]serverRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	wanted := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		wanted[id] = struct{}{}
+	}
+	removed := make([]serverRecord, 0, len(ids))
+	remaining := make([]serverRecord, 0, len(s.state.Servers)-len(ids))
+	for _, record := range s.state.Servers {
+		if _, ok := wanted[record.ID]; ok {
+			removed = append(removed, record)
+			continue
+		}
+		remaining = append(remaining, record)
+	}
+	if len(removed) != len(ids) {
+		return nil, errNotFound
+	}
+	original := s.state.Servers
+	s.state.Servers = remaining
+	if err := s.saveLocked(); err != nil {
+		s.state.Servers = original
+		return nil, err
+	}
+	return removed, nil
 }
 
 func (s *store) records() []serverRecord {
@@ -1185,7 +1533,7 @@ func (s *store) siteView(canApply bool) siteView {
 		CertificateExpiry: s.state.Site.CertificateNotAfter,
 		AppliedAt:         s.state.Site.AppliedAt,
 		CanApply:          canApply,
-		Job: siteApplyJobView{ID: job.ID, Domain: job.Domain, Status: job.Status, Stage: job.Stage, Message: job.Message, CreatedAt: job.CreatedAt, StartedAt: job.StartedAt, FinishedAt: job.FinishedAt},
+		Job:               siteApplyJobView{ID: job.ID, Domain: job.Domain, Status: job.Status, Stage: job.Stage, Message: job.Message, CreatedAt: job.CreatedAt, StartedAt: job.StartedAt, FinishedAt: job.FinishedAt},
 	}
 }
 
@@ -1259,7 +1607,7 @@ func (s *store) recoverInterruptedSiteApply() bool {
 
 func (r serverRecord) toView() serverView {
 	panelURL, _ := managementPanelURL(r)
-	return serverView{ID: r.ID, Name: r.Name, Address: r.Address, Scheme: r.Scheme, Port: r.Port, BasePath: r.BasePath, PanelURL: panelURL, ValidFrom: r.ValidFrom, ValidUntil: r.ValidUntil, Status: r.Status, LatencyMS: r.LatencyMS, TotalTraffic: r.TotalTraffic, PanelVersion: r.PanelVersion, XrayState: r.XrayState, LineCount: r.LineCount, AbnormalCount: r.AbnormalCount, LastError: r.LastError, LastHeartbeat: r.LastHeartbeat}
+	return serverView{ID: r.ID, Name: r.Name, Address: r.Address, Scheme: r.Scheme, Port: r.Port, BasePath: r.BasePath, PanelURL: panelURL, ValidFrom: r.ValidFrom, ValidUntil: r.ValidUntil, Status: r.Status, TotalTraffic: r.TotalTraffic, PanelVersion: r.PanelVersion, XrayState: r.XrayState, LineCount: r.LineCount, AbnormalCount: r.AbnormalCount, LastError: r.LastError, LastHeartbeat: r.LastHeartbeat}
 }
 
 func decodeJSON(r *http.Request, target any) error {
